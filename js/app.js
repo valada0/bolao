@@ -1,21 +1,16 @@
-import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
+import { VestiStore } from "./storage.js";
 
 (() => {
   "use strict";
 
   const app = document.getElementById("app");
   const toastRegion = document.getElementById("toast-region");
-  const emptyState = () => ({ users: [], pools: [], matches: [], predictions: [], currentUserId: null, currentPoolId: null });
-  let state = emptyState();
-  let sessionUser = null;
-  let isLoading = false;
-  let loadError = "";
-  let loadSequence = 0;
-  let realtimeRefresh = null;
-  let realtimeChannel = null;
-  let hasReportedRealtimeError = false;
+  let state = VestiStore.get();
   let adminTab = "matches";
   let searchTerm = "";
+  let selectedPoolId = null;
+  let configured = false;
+  let loading = true;
 
   const icons = {
     ball: '<circle cx="12" cy="12" r="9"/><path d="m12 7 3 2v3l-3 2-3-2V9l3-2ZM9 9l-3-1m9 1 3-1m-9 4-4 3m10-3 4 3m-8-1v5m4-5v5"/>',
@@ -48,7 +43,7 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
   const getMatch = (id) => state.matches.find((match) => match.id === id);
   const getUser = (id) => state.users.find((user) => user.id === id);
   const avatar = (user, cls = "") => `<span class="avatar ${cls}">${user && user.avatar ? `<img src="${esc(user.avatar)}" alt="">` : esc(initials(user ? user.name : "?"))}</span>`;
-  const poolEmblem = (pool, cls = "") => `<span class="pool-emblem ${cls}">${pool?.imageUrl ? `<img src="${esc(pool.imageUrl)}" alt="">` : esc(pool?.emoji || "⚽")}</span>`;
+  const teamBadge = (emoji, shield) => `<span class="team-badge">${shield ? `<img src="${esc(shield)}" alt="">` : esc(emoji || "⚽")}</span>`;
   const pointSettings = (pool) => ({ exact: 10, outcome: 5, goals: 2, ...(pool && pool.settings || {}) });
   const outcome = (home, away) => home > away ? "home" : home < away ? "away" : "draw";
   const scorePrediction = (prediction, match, pool) => {
@@ -64,14 +59,13 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
   const standings = (pool) => (pool ? pool.members : []).map((userId) => {
     const user = getUser(userId);
     if (!user) return null;
+    const serverRow = state.standings.find((row) => row.poolId === pool.id && row.userId === userId);
+    if (serverRow) return { user, ...serverRow };
     const predictions = state.predictions.filter((item) => item.poolId === pool.id && item.userId === userId);
     const completed = predictions.filter((item) => getMatch(item.matchId)?.status === "finished");
     const points = completed.reduce((sum, item) => sum + scorePrediction(item, getMatch(item.matchId), pool), 0);
     const hits = completed.filter((item) => scorePrediction(item, getMatch(item.matchId), pool) > 0).length;
-    const exact = completed.filter((item) => {
-      const match = getMatch(item.matchId);
-      return match && item.homeScore === match.homeScore && item.awayScore === match.awayScore;
-    }).length;
+    const exact = completed.filter((item) => scorePrediction(item, getMatch(item.matchId), pool) === Number(pointSettings(pool).exact)).length;
     return { user, points, predictions: predictions.length, completed: completed.length, hits, exact, accuracy: completed.length ? Math.round(hits / completed.length * 100) : 0 };
   }).filter(Boolean).sort((a, b) => b.points - a.points || b.exact - a.exact || b.hits - a.hits || a.user.name.localeCompare(b.user.name, "pt-BR"));
   const userTotalPoints = (userId) => state.pools.reduce((sum, pool) => sum + (standings(pool).find((row) => row.user.id === userId)?.points || 0), 0);
@@ -85,37 +79,38 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
     toastRegion.appendChild(node);
     setTimeout(() => node.remove(), 3400);
   };
-  const reportError = (error) => {
-    console.error("Operação Vesti não concluída:", error);
-    toast(error?.message || "Não foi possível concluir a operação.", true);
+  const refreshState = async () => {
+    state = await VestiStore.refresh();
+    render();
   };
-  const refreshState = async (showLoading = false) => {
-    if (!sessionUser) { state = emptyState(); render(); return; }
-    const request = ++loadSequence;
-    loadError = "";
-    if (showLoading) { isLoading = true; render(); }
+  const run = async (operation, successMessage, navigate) => {
     try {
-      const nextState = await VestiBackend.loadState(sessionUser);
-      if (request !== loadSequence) return;
-      state = { ...nextState, currentPoolId: state.currentPoolId };
-      isLoading = false;
-      render();
+      await operation();
+      await refreshState();
+      if (successMessage) toast(successMessage);
+      if (navigate) go(navigate);
     } catch (error) {
-      if (request !== loadSequence) return;
-      isLoading = false;
-      loadError = error.message || "Falha ao carregar os dados do Supabase.";
-      render();
+      toast(error.message || "Não foi possível concluir a operação.", true);
     }
-  };
-  const refreshAfterMutation = async (message) => {
-    await refreshState();
-    if (!loadError && message) toast(message);
+    function editPoolModal(poolId) {
+      const pool = getPool(poolId);
+      if (!pool || !(pool.ownerId === currentUser().id || currentUser().role === "admin")) return toast("Somente o organizador pode editar este bolão.", true);
+      const content = `<div class="field"><label>Nome do bolão</label><input name="name" value="${esc(pool.name)}" required minlength="3" maxlength="48"></div><div class="field" style="margin-top:12px"><label>Descrição</label><textarea name="description" maxlength="240">${esc(pool.description)}</textarea></div><div class="form-grid" style="margin-top:12px"><div class="field"><label>Emoji</label><input name="emoji" value="${esc(pool.emoji)}" maxlength="8"></div><div class="field"><label>Visibilidade</label><select name="visibility"><option value="public" ${pool.visibility === "public" ? "selected" : ""}>Público</option><option value="private" ${pool.visibility === "private" ? "selected" : ""}>Privado</option></select></div></div>`;
+      showModal("Editar bolão", content, "Salvar", async (formData) => {
+        await VestiStore.updatePool(poolId, {
+          name: String(formData.get("name")).trim(),
+          description: String(formData.get("description") || "").trim(),
+          emoji: String(formData.get("emoji") || "⚽"),
+          visibility: String(formData.get("visibility"))
+        });
+        await refreshState();
+        toast("Bolão atualizado.");
+        return true;
+      });
+    }
   };
   const isLocked = (match) => match.status === "finished" || new Date(match.startsAt).getTime() <= Date.now();
   const activeMatches = (pool) => (pool ? pool.matchIds.map(getMatch).filter(Boolean) : state.matches).sort((a, b) => new Date(a.startsAt) - new Date(b.startsAt));
-  const teamBadge = (emoji, logoUrl = "") => logoUrl
-    ? `<span class="team-badge"><img src="${esc(logoUrl)}" alt="Escudo do time"></span>`
-    : `<span class="team-badge">${esc(emoji || "⚽")}</span>`;
   const formatCountdown = (startsAt) => {
     const diff = new Date(startsAt).getTime() - Date.now();
     if (diff <= 0) return "Palpites encerrados";
@@ -162,12 +157,12 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
     const locked = isLocked(match);
     const score = match.status === "finished" ? `<span class="score-display">${match.homeScore} – ${match.awayScore}</span>` : '<span class="score-display">vs</span>';
     return `<div class="match-row"><div class="match-time"><strong>${date(match.startsAt, { day: "2-digit", month: "short" })}</strong>${date(match.startsAt, { hour: "2-digit", minute: "2-digit" })} · ${esc(match.competition || "Partida")}</div>
-      <div class="teams"><span class="team">${teamBadge(match.homeEmoji, match.homeLogoUrl)}<span class="team-name">${esc(match.home)}</span></span>${score}<span class="team"><span class="team-name">${esc(match.away)}</span>${teamBadge(match.awayEmoji, match.awayLogoUrl)}</span></div>
+      <div class="teams"><span class="team">${teamBadge(match.homeEmoji, match.homeShield)}<span class="team-name">${esc(match.home)}</span></span>${score}<span class="team"><span class="team-name">${esc(match.away)}</span>${teamBadge(match.awayEmoji, match.awayShield)}</span></div>
       <div class="match-action">${match.status === "finished" ? `<span class="tag tag-green">${prediction ? `${scorePrediction(prediction, match, pool)} pts` : "Encerrado"}</span>` : `<a class="btn ${prediction ? "btn-secondary" : "btn-primary"} btn-small" href="#picks${pool ? `/${pool.id}` : ""}">${locked ? "Ver palpite" : prediction ? `${prediction.homeScore}–${prediction.awayScore} · Editar` : "Palpitar"}</a>`}</div></div>`;
   }
   function poolCard(pool, userId) {
     const userRank = standings(pool).find((row) => row.user.id === userId);
-    return `<a class="pool-card" href="#pool/${encodeURIComponent(pool.id)}">${poolEmblem(pool)}<span class="pool-info"><strong>${esc(pool.name)}</strong><span>${pool.members.length} participantes · ${pool.visibility === "private" ? "Privado" : "Público"}</span></span><span class="pool-points"><strong>${userRank?.points || 0}</strong><span>pontos</span></span></a>`;
+    return `<a class="pool-card" href="#pool/${encodeURIComponent(pool.id)}"><span class="pool-emblem">${esc(pool.emoji || "⚽")}</span><span class="pool-info"><strong>${esc(pool.name)}</strong><span>${pool.members.length} participantes · ${pool.visibility === "private" ? "Privado" : "Público"}</span></span><span class="pool-points"><strong>${userRank?.points || 0}</strong><span>pontos</span></span></a>`;
   }
   function rankRows(pool, limit = 5) {
     const rows = standings(pool).slice(0, limit);
@@ -198,7 +193,7 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
       ${register ? `<div class="field"><label for="auth-code">Código de convite <span class="field-help">(opcional)</span></label><input id="auth-code" name="inviteCode" placeholder="Ex.: BR25GO" maxlength="24"></div>` : ""}
       <button class="btn btn-primary" type="submit">${register ? "Criar minha conta" : "Entrar"} ${icon("arrow")}</button>
       <div class="auth-switch">${register ? "Já tem uma conta?" : "Ainda não tem uma conta?"} <a href="#${register ? "login" : "register"}">${register ? "Fazer login" : "Criar conta grátis"}</a></div>
-      ${!register ? `<div class="demo-note">Primeira vez aqui? Crie uma conta no link acima. O acesso administrativo inicial deve ser habilitado pelo proprietário do projeto no Supabase; veja as instruções no README.</div>` : ""}</form></section></div>`;
+      ${!register ? `<div class="demo-note">Entre com sua conta do Supabase. Se ainda não tem cadastro, crie uma conta — pode ser necessário confirmar o endereço de e-mail antes do primeiro acesso.</div>` : ""}</form></section></div>`;
   }
   function explorePage() {
     const user = currentUser();
@@ -208,10 +203,10 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
       <div class="filter-row"><span class="tag">${pools.length} bolões encontrados</span>${button(`${icon("people")} Entrar com código`, "join-pool", "btn-secondary")}</div>
       <div class="dashboard-grid"><div class="stack">${pools.length ? pools.map((pool) => {
         const joined = pool.members.includes(user.id);
-        const lead = joined ? standings(pool)[0] : null;
+        const lead = standings(pool)[0];
         const nextMatch = activeMatches(pool).find((match) => match.status === "upcoming");
-        return `<section class="card"><div class="detail-hero">${poolEmblem(pool)}<div class="detail-copy"><h2>${esc(pool.name)}</h2><p>${esc(pool.description || "Sem descrição.")}</p><div class="detail-meta"><span class="tag">${pool.members.length} participantes</span><span class="tag">${pool.visibility === "private" ? `${icon("lock")} Privado` : "Público"}</span><span class="tag">${activeMatches(pool).length} partidas</span></div></div>${joined ? `<a class="btn btn-secondary btn-small" href="#pool/${encodeURIComponent(pool.id)}">Abrir</a>` : `<button class="btn btn-primary btn-small" data-action="join-public" data-pool="${esc(pool.id)}">Participar</button>`}</div>
-          <div class="settings-list"><div class="setting-row"><div><strong>Líder atual</strong><span>${lead ? esc(lead.user.name) : joined ? "Sem pontuação ainda" : "Participe para ver a classificação"}</span></div><span class="tag tag-green">${lead ? `${lead.points} pts` : "—"}</span></div><div class="setting-row"><div><strong>Próxima partida</strong><span>${nextMatch ? `${esc(nextMatch.home)} × ${esc(nextMatch.away)}` : "Nenhuma agendada"}</span></div><span>${nextMatch ? `<span class="tag">${date(nextMatch.startsAt, { day: "2-digit", month: "short" })}</span>` : ""}</span></div></div></section>`;
+        return `<section class="card"><div class="detail-hero"><span class="pool-emblem">${esc(pool.emoji || "⚽")}</span><div class="detail-copy"><h2>${esc(pool.name)}</h2><p>${esc(pool.description || "Sem descrição.")}</p><div class="detail-meta"><span class="tag">${pool.members.length} participantes</span><span class="tag">${pool.visibility === "private" ? `${icon("lock")} Privado` : "Público"}</span><span class="tag">${activeMatches(pool).length} partidas</span></div></div>${joined ? `<a class="btn btn-secondary btn-small" href="#pool/${encodeURIComponent(pool.id)}">Abrir</a>` : `<button class="btn btn-primary btn-small" data-action="join-public" data-pool="${esc(pool.id)}">Participar</button>`}</div>
+          <div class="settings-list"><div class="setting-row"><div><strong>Líder atual</strong><span>${lead ? esc(lead.user.name) : "Sem pontuação ainda"}</span></div><span class="tag tag-green">${lead ? `${lead.points} pts` : "—"}</span></div><div class="setting-row"><div><strong>Próxima partida</strong><span>${nextMatch ? `${esc(nextMatch.home)} × ${esc(nextMatch.away)}` : "Nenhuma agendada"}</span></div><span>${nextMatch ? `<span class="tag">${date(nextMatch.startsAt, { day: "2-digit", month: "short" })}</span>` : ""}</span></div></div></section>`;
       }).join("") : '<div class="card empty-state"><strong>Nenhum bolão encontrado</strong>Tente outra busca ou crie seu próprio bolão.</div>'}</div>
       <div class="stack"><section class="card"><div class="card-heading"><h2>Faça seu jogo</h2></div><p class="subtitle" style="line-height:1.7">Crie um bolão público ou privado, escolha as regras e convide quem quiser. Cada bolão tem partidas, participantes e ranking independentes.</p><a class="btn btn-primary" href="#create">${icon("plus")} Criar meu bolão</a></section><section class="card"><div class="card-heading"><h2>Já tem um convite?</h2></div><p class="subtitle" style="line-height:1.7">Peça o código ao organizador e participe em segundos.</p>${button(`${icon("people")} Usar código`, "join-pool", "btn-secondary")}</section></div></div>`;
   }
@@ -221,7 +216,6 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
       <div class="field full"><label for="pool-name">Nome do bolão *</label><input id="pool-name" name="name" placeholder="Ex.: Amigos do Brasileirão" required minlength="3" maxlength="48"></div>
       <div class="field full"><label for="pool-description">Descrição</label><textarea id="pool-description" name="description" placeholder="Conte um pouco sobre seu bolão..." maxlength="240"></textarea></div>
       <div class="field"><label for="pool-emoji">Escudo ou emoji</label><select id="pool-emoji" name="emoji"><option>⚽</option><option>🏆</option><option>🥇</option><option>🏟️</option><option>🔥</option><option>⭐</option><option>🐯</option><option>👑</option></select><span class="field-help">Escolha um símbolo para identificar seu bolão.</span></div>
-      <div class="field"><label for="pool-image">Imagem do bolão <span class="field-help">(opcional)</span></label><input id="pool-image" name="image" type="file" accept="image/png,image/jpeg,image/webp"><span class="field-help">JPG, PNG ou WebP; até 1 MB.</span></div>
       <div class="field"><label for="pool-visibility">Privacidade</label><select id="pool-visibility" name="visibility"><option value="public">Público — qualquer pessoa pode entrar</option><option value="private">Privado — somente com código de convite</option></select></div>
       <div class="field"><label for="pool-exact">Placar exato (pontos)</label><input id="pool-exact" name="exact" type="number" min="0" max="100" value="10" required></div>
       <div class="field"><label for="pool-outcome">Resultado correto (pontos)</label><input id="pool-outcome" name="outcome" type="number" min="0" max="100" value="5" required></div>
@@ -234,10 +228,11 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
     const user = currentUser();
     if (!pool || !pool.members.includes(user.id)) return `<div class="card empty-state"><strong>Bolão não encontrado</strong>Este bolão não existe ou você ainda não participa dele.<div style="margin-top:12px"><a class="btn btn-primary" href="#explore">Explorar bolões</a></div></div>`;
     state.currentPoolId = pool.id;
+    selectedPoolId = pool.id;
     const isOwner = pool.ownerId === user.id || user.role === "admin";
     const matches = activeMatches(pool);
-    return `<div class="page-heading"><div><div class="eyebrow">Disputa independente</div><h1>${esc(pool.name)}</h1><p class="subtitle">Acompanhe as partidas, palpites e classificação.</p></div><a class="btn btn-secondary" href="#ranking/${encodeURIComponent(pool.id)}">${icon("trophy")} Ranking</a></div>
-      <section class="detail-hero">${poolEmblem(pool)}<div class="detail-copy"><h2>${esc(pool.name)}</h2><p>${esc(pool.description || "Sem descrição.")}</p><div class="detail-meta"><span class="tag">${pool.members.length} participantes</span><span class="tag">${pool.visibility === "private" ? `${icon("lock")} Privado` : "Público"}</span><span class="tag">${matches.length} partidas</span></div></div>${button(`${icon("copy")} Convidar`, "copy-invite", "btn-secondary btn-small", `data-pool="${esc(pool.id)}"`)}</section>
+    return `<div class="page-heading"><div><div class="eyebrow">Disputa independente</div><h1>${esc(pool.name)}</h1><p class="subtitle">Acompanhe as partidas, palpites e classificação.</p></div><div class="hero-actions">${isOwner ? `<button class="btn btn-secondary" data-action="edit-pool" data-pool="${esc(pool.id)}">${icon("edit")} Editar</button>` : ""}<a class="btn btn-secondary" href="#ranking/${encodeURIComponent(pool.id)}">${icon("trophy")} Ranking</a></div></div>
+      <section class="detail-hero"><span class="pool-emblem">${esc(pool.emoji || "⚽")}</span><div class="detail-copy"><h2>${esc(pool.name)}</h2><p>${esc(pool.description || "Sem descrição.")}</p><div class="detail-meta"><span class="tag">${pool.members.length} participantes</span><span class="tag">${pool.visibility === "private" ? `${icon("lock")} Privado` : "Público"}</span><span class="tag">${matches.length} partidas</span></div></div>${button(`${icon("copy")} Convidar`, "copy-invite", "btn-secondary btn-small", `data-pool="${esc(pool.id)}"`)}</section>
       <div class="dashboard-grid"><div class="stack"><section class="card"><div class="card-heading"><h2>Partidas do bolão</h2><a class="text-link" href="#picks/${encodeURIComponent(pool.id)}">Fazer palpites →</a></div><div class="match-list">${matches.length ? matches.map((match) => matchRow(match, pool, user.id)).join("") : '<div class="empty-state">O administrador ainda não adicionou partidas.</div>'}</div></section>
       <section class="card"><div class="card-heading"><h2>Participantes</h2><span class="tag">${pool.members.length} no bolão</span></div>${rankRows(pool, 10)}</section></div>
       <div class="stack"><section class="card"><div class="card-heading"><h2>Ranking do bolão</h2><a class="text-link" href="#ranking/${encodeURIComponent(pool.id)}">Completo →</a></div>${rankRows(pool, 5)}</section>
@@ -250,6 +245,7 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
     let pool = poolId ? getPool(decodeURIComponent(poolId)) : getPool(state.currentPoolId);
     if (!pool || !pool.members.includes(user.id)) pool = joined[0];
     if (!pool) return `<div class="page-heading"><div><div class="eyebrow">Na sua hora</div><h1>Meus palpites</h1><p class="subtitle">Entre em um bolão para começar a palpitar.</p></div></div><section class="card empty-state"><strong>Você ainda não participa de um bolão</strong>Explore as disputas disponíveis e faça seu primeiro palpite.<div style="margin-top:12px"><a class="btn btn-primary" href="#explore">Explorar bolões</a></div></section>`;
+    selectedPoolId = pool.id;
     state.currentPoolId = pool.id;
     const search = searchTerm.toLocaleLowerCase("pt-BR");
     const matches = activeMatches(pool).filter((match) => !search || `${match.home} ${match.away} ${match.competition}`.toLocaleLowerCase("pt-BR").includes(search));
@@ -262,7 +258,7 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
         const canSeeOthers = locked && pool.settings.showPicks;
         const otherPredictions = canSeeOthers ? state.predictions.filter((item) => item.poolId === pool.id && item.matchId === match.id && item.userId !== user.id) : [];
         return `<section class="card match-predict-card"><div class="card-heading"><div><span class="eyebrow">${esc(match.competition || "Partida")}</span><h2 style="margin-top:3px">${date(match.startsAt, { weekday: "long", day: "2-digit", month: "long", hour: "2-digit", minute: "2-digit" })}</h2></div><span class="tag${match.status === "finished" ? " tag-green" : locked ? " tag-live" : ""}">${match.status === "finished" ? "Finalizado" : locked ? "Em andamento" : formatCountdown(match.startsAt)}</span></div>
-        <form data-form="prediction" data-pool="${esc(pool.id)}" data-match="${esc(match.id)}"><div class="predict-teams"><div class="predict-team">${teamBadge(match.homeEmoji, match.homeLogoUrl)}<strong>${esc(match.home)}</strong></div><div class="score-inputs"><input aria-label="Gols de ${esc(match.home)}" name="homeScore" type="number" min="0" max="99" inputmode="numeric" value="${prediction ? prediction.homeScore : ""}" placeholder="–" required ${locked ? "disabled" : ""}><span>×</span><input aria-label="Gols de ${esc(match.away)}" name="awayScore" type="number" min="0" max="99" inputmode="numeric" value="${prediction ? prediction.awayScore : ""}" placeholder="–" required ${locked ? "disabled" : ""}></div><div class="predict-team">${teamBadge(match.awayEmoji, match.awayLogoUrl)}<strong>${esc(match.away)}</strong></div></div><div class="match-card-footer"><span>${prediction ? `Seu palpite: ${prediction.homeScore} × ${prediction.awayScore}${match.status === "finished" ? ` · ${scorePrediction(prediction, match, pool)} pontos` : ""}` : locked ? "Você não registrou um palpite antes do início." : "Palpite ainda não registrado"}</span>${locked ? (match.status === "finished" ? `<span class="result-score">Resultado: ${match.homeScore} × ${match.awayScore}</span>` : '<span class="tag tag-live">Palpites fechados</span>') : `<button class="btn ${prediction ? "btn-secondary" : "btn-primary"} btn-small" type="submit">${prediction ? "Atualizar palpite" : "Salvar palpite"}</button>`}</div></form>
+        <form data-form="prediction" data-pool="${esc(pool.id)}" data-match="${esc(match.id)}"><div class="predict-teams"><div class="predict-team">${teamBadge(match.homeEmoji, match.homeShield)}<strong>${esc(match.home)}</strong></div><div class="score-inputs"><input aria-label="Gols de ${esc(match.home)}" name="homeScore" type="number" min="0" max="99" inputmode="numeric" value="${prediction ? prediction.homeScore : ""}" placeholder="–" required ${locked ? "disabled" : ""}><span>×</span><input aria-label="Gols de ${esc(match.away)}" name="awayScore" type="number" min="0" max="99" inputmode="numeric" value="${prediction ? prediction.awayScore : ""}" placeholder="–" required ${locked ? "disabled" : ""}></div><div class="predict-team">${teamBadge(match.awayEmoji, match.awayShield)}<strong>${esc(match.away)}</strong></div></div><div class="match-card-footer"><span>${prediction ? `Seu palpite: ${prediction.homeScore} × ${prediction.awayScore}${match.status === "finished" ? ` · ${scorePrediction(prediction, match, pool)} pontos` : ""}` : locked ? "Você não registrou um palpite antes do início." : "Palpite ainda não registrado"}</span>${locked ? (match.status === "finished" ? `<span class="result-score">Resultado: ${match.homeScore} × ${match.awayScore}</span>` : '<span class="tag tag-live">Palpites fechados</span>') : `<button class="btn ${prediction ? "btn-secondary" : "btn-primary"} btn-small" type="submit">${prediction ? "Atualizar palpite" : "Salvar palpite"}</button>`}</div></form>
         ${otherPredictions.length ? `<div class="settings-list section-spacer">${otherPredictions.map((item) => `<div class="setting-row"><div class="table-user">${avatar(getUser(item.userId))}<strong>${esc(getUser(item.userId)?.name || "Participante")}</strong></div><span class="tag">${item.homeScore} × ${item.awayScore}</span></div>`).join("")}</div>` : ""}
         </section>`;
       }).join("") : '<div class="card empty-state"><strong>Nenhuma partida disponível</strong>Este bolão ainda não tem jogos ou sua busca não encontrou resultados.</div>'}</div>`;
@@ -273,6 +269,7 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
     let pool = poolId ? getPool(decodeURIComponent(poolId)) : getPool(state.currentPoolId);
     if (!pool || !pool.members.includes(user.id)) pool = pools[0];
     if (!pool) return `<div class="page-heading"><div><div class="eyebrow">Quem está na frente?</div><h1>Classificação</h1><p class="subtitle">Participe de um bolão para acompanhar o ranking.</p></div></div><section class="card empty-state">Nenhum ranking disponível ainda. <a class="text-link" href="#explore">Explorar bolões →</a></section>`;
+    selectedPoolId = pool.id;
     state.currentPoolId = pool.id;
     const rows = standings(pool);
     return `<div class="page-heading"><div><div class="eyebrow">Só os melhores</div><h1>Classificação</h1><p class="subtitle">O ranking é atualizado automaticamente após cada resultado.</p></div></div>
@@ -295,28 +292,27 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
   function adminPage() {
     const user = currentUser();
     if (user.role !== "admin") return `<section class="card empty-state"><strong>Acesso restrito</strong>Somente administradores podem acessar esta página.<div style="margin-top:12px"><a class="btn btn-primary" href="#home">Voltar</a></div></section>`;
-    const tabs = `<div class="admin-tabs">${[["matches", "Partidas"], ["pools", "Bolões"], ["users", "Usuários"]].map(([key, title]) => `<button class="btn ${adminTab === key ? "active" : "btn-secondary"} btn-small" data-action="admin-tab" data-tab="${key}">${title}</button>`).join("")}</div>`;
+    const tabs = `<div class="admin-tabs">${[["matches", "Partidas"], ["teams", "Times"], ["pools", "Bolões"], ["users", "Usuários"]].map(([key, title]) => `<button class="btn ${adminTab === key ? "active" : "btn-secondary"} btn-small" data-action="admin-tab" data-tab="${key}">${title}</button>`).join("")}</div>`;
     let body = "";
     if (adminTab === "matches") {
       body = `<div class="card-heading"><h2>Partidas cadastradas</h2><button class="btn btn-primary btn-small" data-action="new-match">${icon("plus")} Nova partida</button></div><div class="table-wrap"><table class="data-table"><thead><tr><th>PARTIDA</th><th>COMPETIÇÃO</th><th>DATA</th><th>RESULTADO</th><th>AÇÕES</th></tr></thead><tbody>${state.matches.slice().sort((a, b) => new Date(a.startsAt) - new Date(b.startsAt)).map((match) => `<tr><td>${esc(match.home)} × ${esc(match.away)}</td><td>${esc(match.competition || "—")}</td><td>${date(match.startsAt, { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</td><td>${match.status === "finished" ? `<span class="result-score">${match.homeScore} × ${match.awayScore}</span>` : '<span class="tag">Agendado</span>'}</td><td><button class="btn btn-secondary btn-small" data-action="edit-match" data-match="${esc(match.id)}">${match.status === "finished" ? "Corrigir resultado" : "Editar partida"}</button></td></tr>`).join("")}</tbody></table></div>`;
+    } else if (adminTab === "teams") {
+      body = `<div class="card-heading"><h2>Times e escudos</h2><span class="tag">${state.teams.length} times</span></div><p class="subtitle" style="margin-bottom:14px">Os times são cadastrados automaticamente ao criar ou editar uma partida. Você pode adicionar ou trocar o escudo aqui.</p><div class="table-wrap"><table class="data-table"><thead><tr><th>TIME</th><th>ESCUDO</th><th>ENVIAR IMAGEM</th></tr></thead><tbody>${state.teams.map((team) => `<tr><td><span class="table-user">${teamBadge(team.emoji, team.shield)}<strong>${esc(team.name)}</strong></span></td><td>${team.shield ? "Cadastrado" : "Usando emoji"}</td><td><input type="file" accept="image/png,image/jpeg,image/webp,image/gif" aria-label="Enviar escudo de ${esc(team.name)}" data-team-shield="${esc(team.id)}"></td></tr>`).join("")}</tbody></table></div>`;
     } else if (adminTab === "pools") {
-      body = `<div class="card-heading"><h2>Bolões cadastrados</h2><span class="tag">${state.pools.length} bolões</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>BOLÃO</th><th>ORGANIZADOR</th><th>VISIBILIDADE</th><th>PARTICIPANTES</th><th>AÇÕES</th></tr></thead><tbody>${state.pools.map((pool) => `<tr><td>${esc(pool.emoji)} ${esc(pool.name)}</td><td>${esc(getUser(pool.ownerId)?.name || "—")}</td><td>${pool.visibility === "private" ? "Privado" : "Público"}</td><td>${pool.members.length}</td><td><a class="btn btn-secondary btn-small" href="#pool/${encodeURIComponent(pool.id)}">Abrir</a></td></tr>`).join("")}</tbody></table></div>`;
+      body = `<div class="card-heading"><h2>Bolões cadastrados</h2><span class="tag">${state.pools.length} bolões</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>BOLÃO</th><th>ORGANIZADOR</th><th>VISIBILIDADE</th><th>PARTICIPANTES</th><th>AÇÕES</th></tr></thead><tbody>${state.pools.map((pool) => `<tr><td>${esc(pool.emoji)} ${esc(pool.name)}</td><td>${esc(getUser(pool.ownerId)?.name || "—")}</td><td>${pool.visibility === "private" ? "Privado" : "Público"}</td><td>${pool.members.length}</td><td><button class="btn btn-secondary btn-small" data-action="edit-pool" data-pool="${esc(pool.id)}">Editar</button> <button class="btn btn-danger btn-small" data-action="delete-pool" data-pool="${esc(pool.id)}">Excluir</button></td></tr>`).join("")}</tbody></table></div>`;
     } else {
-      body = `<div class="card-heading"><h2>Usuários</h2><span class="tag">${state.users.length} cadastrados</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>USUÁRIO</th><th>E-MAIL</th><th>BOLÕES</th><th>PERMISSÃO</th><th>AÇÕES</th></tr></thead><tbody>${state.users.map((item) => `<tr><td><span class="table-user">${avatar(item)}<strong>${esc(item.name)}</strong></span></td><td>${esc(item.email)}</td><td>${userPools(item.id).length}</td><td>${item.role === "admin" ? '<span class="tag tag-green">Admin</span>' : '<span class="tag">Participante</span>'}</td><td>${item.id === user.id ? '<span class="field-help">Sua conta</span>' : `<button class="btn btn-secondary btn-small" data-action="toggle-admin" data-user="${esc(item.id)}">${item.role === "admin" ? "Remover admin" : "Tornar admin"}</button>`}</td></tr>`).join("")}</tbody></table></div>`;
+      body = `<div class="card-heading"><h2>Usuários</h2><span class="tag">${state.users.length} cadastrados</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>USUÁRIO</th><th>BOLÕES</th><th>PERMISSÃO</th><th>AÇÕES</th></tr></thead><tbody>${state.users.map((item) => `<tr><td><span class="table-user">${avatar(item)}<strong>${esc(item.name)}</strong></span></td><td>${userPools(item.id).length}</td><td>${item.role === "admin" ? '<span class="tag tag-green">Admin</span>' : '<span class="tag">Participante</span>'}</td><td>${item.id === user.id ? '<span class="field-help">Sua conta</span>' : `<button class="btn btn-secondary btn-small" data-action="toggle-admin" data-user="${esc(item.id)}">${item.role === "admin" ? "Remover admin" : "Tornar admin"}</button>`}</td></tr>`).join("")}</tbody></table></div>`;
     }
     return `<div class="page-heading"><div><div class="eyebrow">Gestão da plataforma</div><h1>Painel administrativo</h1><p class="subtitle">Gerencie partidas, usuários e bolões.</p></div></div>${tabs}<section class="card">${body}</section>`;
   }
   function render() {
-    if (!isSupabaseConfigured) {
-      app.innerHTML = `<div class="auth-wrap"><aside class="auth-aside"><a class="brand" href="#"><span class="brand-mark">${icon("ball")}</span><span>vesti<em>.</em></span></a><div class="auth-promo"><div class="eyebrow">Configuração necessária</div><h1>Conecte seu projeto ao <span>Supabase.</span></h1><p>As credenciais são carregadas do arquivo .env local durante o desenvolvimento e nunca devem incluir uma service_role key.</p></div><div class="auth-foot">© 2026 Vesti</div></aside><section class="auth-content"><div class="auth-form"><div class="eyebrow">Primeiros passos</div><h2>Configure o backend</h2><p>Copie <code>.env.example</code> para <code>.env</code>, adicione a URL do projeto e a chave publishable/anon do Supabase. Depois reinicie o servidor local.</p><div class="demo-note">Antes de entrar, execute <strong>supabase/schema.sql</strong> no SQL Editor do seu projeto. Consulte o README para o passo a passo completo.</div></div></section></div>`;
+    state = VestiStore.get();
+    if (!configured) {
+      app.innerHTML = `<main class="auth-content"><section class="auth-form"><div class="eyebrow">Configuração necessária</div><h1>Conecte seu projeto Supabase</h1><p>Copie <code>.env.example</code> para <code>.env.local</code>, configure a URL e a chave anon/public do projeto e reinicie o servidor.</p><p>Depois, execute <code>supabase/schema.sql</code> no SQL Editor do seu projeto. Instruções completas estão no README.</p></section></main>`;
       return;
     }
-    if (loadError) {
-      app.innerHTML = `<div class="auth-content"><section class="auth-form"><div class="eyebrow">Falha ao carregar</div><h2>Não foi possível conectar</h2><p>${esc(loadError)}</p><button class="btn btn-primary" data-action="retry-load">Tentar novamente</button></section></div>`;
-      return;
-    }
-    if (isLoading) {
-      app.innerHTML = `<div class="auth-content"><section class="auth-form"><div class="eyebrow">Vesti</div><h2>Carregando seu jogo...</h2><p>Conectando com segurança ao Supabase.</p></section></div>`;
+    if (loading) {
+      app.innerHTML = `<main class="auth-content"><section class="auth-form"><div class="eyebrow">Vesti</div><h1>Conectando...</h1><p>Carregando sua sessão e os dados compartilhados do Supabase.</p></section></main>`;
       return;
     }
     const route = routeNow();
@@ -349,35 +345,28 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
     backdrop.addEventListener("click", (event) => {
       if (event.target === backdrop || event.target.closest("[data-action='close-modal']")) backdrop.remove();
     });
+    app.addEventListener("change", (event) => {
+      const input = event.target.closest("input[data-team-shield]");
+      const file = input?.files?.[0];
+      if (!input || !file) return;
+      run(() => VestiStore.uploadTeamShield(input.dataset.teamShield, file), "Escudo atualizado.");
+    });
     backdrop.querySelector("form").addEventListener("submit", async (event) => {
       event.preventDefault();
-      const form = event.currentTarget;
-      if (!form.reportValidity()) return;
-      const submit = form.querySelector('button[type="submit"]');
-      submit.disabled = true;
+      const formData = new FormData(event.currentTarget);
       try {
-        const formData = new FormData(form);
-        if (onSubmit && await onSubmit(formData) === false) { submit.disabled = false; return; }
+        if (onSubmit && await onSubmit(formData) === false) return;
         backdrop.remove();
       } catch (error) {
-        submit.disabled = false;
-        reportError(error);
+        toast(error.message || "Não foi possível concluir a operação.", true);
       }
     });
   }
   function bindDynamicForms() {
     app.querySelectorAll('form[data-form]:not([data-bound])').forEach((form) => {
       form.dataset.bound = "true";
-      form.addEventListener("submit", async (event) => {
-        const submit = form.querySelector('button[type="submit"]');
-        if (submit) submit.disabled = true;
-        try {
-          await handleForm(event);
-        } catch (error) {
-          reportError(error);
-        } finally {
-          if (submit && form.isConnected) submit.disabled = false;
-        }
+      form.addEventListener("submit", (event) => {
+        handleForm(event).catch((error) => toast(error.message || "Não foi possível concluir a operação.", true));
       });
     });
   }
@@ -390,55 +379,42 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
     if (type === "modal") return;
     if (type === "login") {
       const email = String(formData.get("email")).trim().toLowerCase();
-      const { user } = await VestiBackend.signIn(email, String(formData.get("password")));
-      sessionUser = user;
-      await refreshState(true);
-      if (!loadError) { toast(`Bem-vindo(a), ${currentUser()?.name.split(" ")[0] || "de volta"}!`); go("home"); }
+      await run(() => VestiStore.signIn(email, String(formData.get("password"))), "Login realizado com sucesso.", "home");
       return;
     }
     if (type === "register") {
       const email = String(formData.get("email")).trim().toLowerCase();
       const code = String(formData.get("inviteCode") || "").trim().toUpperCase();
-      const result = await VestiBackend.signUp(String(formData.get("name")).trim(), email, String(formData.get("password")));
-      if (!result.session) {
-        toast(code ? "Conta criada. Confirme seu e-mail e entre; depois use o código do bolão." : "Conta criada. Confirme seu e-mail para entrar.");
-        go("login");
-        return;
-      }
-      sessionUser = result.session.user;
-      await refreshState(true);
-      if (loadError) return;
-      if (code) {
-        await VestiBackend.joinPool(code);
-        await refreshState();
-      }
-      toast(code ? "Conta criada e bolão acessado com sucesso!" : "Conta criada com sucesso!");
-      go(code ? `pool/${state.pools.find((pool) => pool.inviteCode.toUpperCase() === code)?.id || ""}` : "home");
+      try {
+        const result = await VestiStore.signUp(String(formData.get("name")).trim(), email, String(formData.get("password")), code);
+        if (result.confirmed) {
+          await refreshState();
+          toast(result.joined ? "Conta criada e convite aplicado." : "Conta criada com sucesso.");
+          go("home");
+        } else {
+          toast(code ? `Cadastro recebido. Confirme seu e-mail para entrar no bolão ${code}.` : "Cadastro recebido. Confirme seu e-mail para entrar.");
+          go("login");
+        }
+      } catch (error) { toast(error.message, true); }
       return;
     }
     if (type === "create-pool") {
-      const cover = form.querySelector('input[name="image"]').files[0];
-      let imageUrl = "";
-      if (cover) {
-        if (!["image/jpeg", "image/png", "image/webp"].includes(cover.type) || cover.size > 1024 * 1024) return toast("Use uma imagem JPG, PNG ou WebP de até 1 MB.", true);
-        imageUrl = await VestiBackend.uploadImage("pool-covers", cover);
-      }
-      const poolId = await VestiBackend.createPool({
-        name: String(formData.get("name")).trim(),
-        description: String(formData.get("description") || "").trim(),
-        emoji: String(formData.get("emoji") || "⚽"),
-        imageUrl,
-        visibility: String(formData.get("visibility")),
-        exact: Number(formData.get("exact")),
-        outcome: Number(formData.get("outcome")),
-        goals: Number(formData.get("goals")),
-        showPicks: formData.get("showPicks") === "on"
-      });
-      state.currentPoolId = poolId;
-      await refreshState();
-      const pool = getPool(poolId);
-      toast(pool ? `Bolão criado! Código: ${pool.inviteCode}` : "Bolão criado com sucesso.");
-      go(`pool/${poolId}`);
+      try {
+        const id = await VestiStore.createPool({
+          name: String(formData.get("name")).trim(),
+          description: String(formData.get("description") || "").trim(),
+          emoji: String(formData.get("emoji") || "⚽"),
+          visibility: String(formData.get("visibility")),
+          exact: Number(formData.get("exact")),
+          outcome: Number(formData.get("outcome")),
+          goals: Number(formData.get("goals")),
+          showPicks: formData.get("showPicks") === "on"
+        });
+        await refreshState();
+        const pool = getPool(id);
+        toast(`Bolão criado! Código: ${pool?.inviteCode || ""}`);
+        go(`pool/${id}`);
+      } catch (error) { toast(error.message, true); }
       return;
     }
     if (type === "prediction") {
@@ -449,9 +425,38 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
       const homeScore = Number(formData.get("homeScore"));
       const awayScore = Number(formData.get("awayScore"));
       if (!Number.isInteger(homeScore) || !Number.isInteger(awayScore) || homeScore < 0 || awayScore < 0 || homeScore > 99 || awayScore > 99) return toast("Informe um placar válido, entre 0 e 99 gols.", true);
-      await VestiBackend.savePrediction(pool.id, match.id, homeScore, awayScore);
-      await refreshAfterMutation("Palpite salvo! Boa sorte.");
+      await run(() => VestiStore.savePrediction(pool.id, match.id, homeScore, awayScore), "Palpite salvo! Boa sorte.");
       return;
+    }
+    if (type === "profile") {
+      const file = form.querySelector('input[type="file"]')?.files[0] || null;
+      await run(() => VestiStore.updateProfile({
+        name: String(formData.get("name")).trim(),
+        file,
+        password: String(formData.get("password") || "")
+      }), "Perfil atualizado.");
+      return;
+    }
+    if (type === "match") {
+      const id = form.dataset.match;
+      const existing = id ? getMatch(id) : null;
+      const startsAt = new Date(String(formData.get("startsAt"))).toISOString();
+      const homeScoreValue = String(formData.get("homeScore") ?? "").trim();
+      const awayScoreValue = String(formData.get("awayScore") ?? "").trim();
+      const finished = homeScoreValue !== "" && awayScoreValue !== "";
+      if (finished && (!Number.isInteger(Number(homeScoreValue)) || !Number.isInteger(Number(awayScoreValue)) || Number(homeScoreValue) < 0 || Number(awayScoreValue) < 0)) return toast("Informe um resultado válido.", true);
+      const data = { home: String(formData.get("home")).trim(), away: String(formData.get("away")).trim(), homeEmoji: String(formData.get("homeEmoji") || "⚽").trim(), awayEmoji: String(formData.get("awayEmoji") || "⚽").trim(), startsAt, status: finished ? "finished" : "upcoming", homeScore: finished ? Number(homeScoreValue) : null, awayScore: finished ? Number(awayScoreValue) : null, competition: String(formData.get("competition") || "").trim() };
+      await run(() => VestiStore.saveMatch(data, existing?.id), finished ? "Resultado salvo. O ranking foi atualizado." : "Partida salva.");
+      return;
+    }
+    if (type === "rules") {
+      const pool = getPool(form.dataset.pool);
+      if (!pool || !(pool.ownerId === currentUser().id || currentUser().role === "admin")) return toast("Você não pode alterar estas regras.", true);
+      await run(() => VestiStore.updatePoolRules(pool.id, {
+        exact: Number(formData.get("exact")),
+        outcome: Number(formData.get("outcome")),
+        goals: Number(formData.get("goals"))
+      }), "Regras salvas e pontuações recalculadas.");
     }
   }
 
@@ -462,36 +467,29 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
       d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
       return d.toISOString().slice(0, 16);
     };
-    const content = `<div class="field"><label>Time da casa</label><input name="home" value="${esc(match?.home || "")}" required maxlength="48" placeholder="Ex.: Flamengo"></div><div class="field"><label>Time visitante</label><input name="away" value="${esc(match?.away || "")}" required maxlength="48" placeholder="Ex.: Palmeiras"></div><div class="form-grid" style="margin-top:12px"><div class="field"><label>Escudo casa (emoji)</label><input name="homeEmoji" value="${esc(match?.homeEmoji || "⚽")}" maxlength="8"></div><div class="field"><label>Escudo visitante (emoji)</label><input name="awayEmoji" value="${esc(match?.awayEmoji || "⚽")}" maxlength="8"></div></div><div class="form-grid" style="margin-top:12px"><div class="field"><label>Enviar escudo da casa</label><input name="homeLogo" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml"><span class="field-help">${match?.homeLogoUrl ? "Envie outra imagem para substituir o escudo atual." : "PNG, JPG, WebP ou SVG; até 2 MB."}</span></div><div class="field"><label>Enviar escudo visitante</label><input name="awayLogo" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml"><span class="field-help">${match?.awayLogoUrl ? "Envie outra imagem para substituir o escudo atual." : "PNG, JPG, WebP ou SVG; até 2 MB."}</span></div></div><div class="field" style="margin-top:12px"><label>Competição / rodada</label><input name="competition" value="${esc(match?.competition || "")}" maxlength="60" placeholder="Ex.: Brasileirão • Rodada 12"></div><div class="field" style="margin-top:12px"><label>Data e horário</label><input name="startsAt" type="datetime-local" value="${dateTimeLocal(match?.startsAt)}" required></div><div class="form-grid" style="margin-top:12px"><div class="field"><label>Gols casa (deixe em branco para pendente)</label><input name="homeScore" type="number" min="0" max="99" value="${match?.status === "finished" ? match.homeScore : ""}"></div><div class="field"><label>Gols visitante</label><input name="awayScore" type="number" min="0" max="99" value="${match?.status === "finished" ? match.awayScore : ""}"></div></div><p class="field-help" style="margin-top:10px">Ao registrar ou corrigir o resultado, os rankings de todos os bolões com esta partida são recalculados automaticamente.</p>`;
+    const poolAssignment = match ? "" : `<div class="field" style="margin-top:12px"><label>Adicionar esta partida aos bolões</label><div class="settings-list">${state.pools.map((pool) => `<label class="setting-row"><span><strong>${esc(pool.name)}</strong><span>${pool.visibility === "private" ? "Privado" : "Público"}</span></span><input name="poolIds" type="checkbox" value="${esc(pool.id)}" checked></label>`).join("")}</div><span class="field-help">Selecione em quais bolões esta partida e seus resultados aparecerão.</span></div>`;
+    const content = `<div class="field"><label>Time da casa</label><input name="home" value="${esc(match?.home || "")}" required maxlength="48" placeholder="Ex.: Flamengo"></div><div class="field"><label>Time visitante</label><input name="away" value="${esc(match?.away || "")}" required maxlength="48" placeholder="Ex.: Palmeiras"></div><div class="form-grid" style="margin-top:12px"><div class="field"><label>Escudo casa (emoji)</label><input name="homeEmoji" value="${esc(match?.homeEmoji || "⚽")}" maxlength="8"></div><div class="field"><label>Escudo visitante (emoji)</label><input name="awayEmoji" value="${esc(match?.awayEmoji || "⚽")}" maxlength="8"></div></div><div class="field" style="margin-top:12px"><label>Competição / rodada</label><input name="competition" value="${esc(match?.competition || "")}" maxlength="60" placeholder="Ex.: Brasileirão • Rodada 12"></div><div class="field" style="margin-top:12px"><label>Data e horário</label><input name="startsAt" type="datetime-local" value="${dateTimeLocal(match?.startsAt)}" required></div><div class="form-grid" style="margin-top:12px"><div class="field"><label>Gols casa (deixe em branco para pendente)</label><input name="homeScore" type="number" min="0" max="99" value="${match?.status === "finished" ? match.homeScore : ""}"></div><div class="field"><label>Gols visitante</label><input name="awayScore" type="number" min="0" max="99" value="${match?.status === "finished" ? match.awayScore : ""}"></div></div>${poolAssignment}<p class="field-help" style="margin-top:10px">Ao registrar ou corrigir o resultado, os rankings dos bolões que contêm esta partida são recalculados automaticamente.</p>`;
     showModal(match ? "Editar partida e resultado" : "Adicionar partida", content, "Salvar partida", async (formData) => {
       const startsAt = String(formData.get("startsAt"));
       if (!startsAt || Number.isNaN(new Date(startsAt).getTime())) { toast("Informe uma data e horário válidos.", true); return false; }
-      const readLogo = async (fieldName, existingUrl) => {
-        const file = formData.get(fieldName);
-        if (!(file instanceof File) || !file.size) return existingUrl || "";
-        if (!["image/jpeg", "image/png", "image/webp", "image/svg+xml"].includes(file.type) || file.size > 2 * 1024 * 1024) throw new Error("Use escudos JPG, PNG, WebP ou SVG de até 2 MB.");
-        return VestiBackend.uploadImage("team-logos", file);
-      };
-      const homeScoreValue = String(formData.get("homeScore") || "").trim();
-      const awayScoreValue = String(formData.get("awayScore") || "").trim();
+      const homeScoreValue = String(formData.get("homeScore") ?? "").trim();
+      const awayScoreValue = String(formData.get("awayScore") ?? "").trim();
       if ((homeScoreValue === "") !== (awayScoreValue === "")) { toast("Informe os gols dos dois times ou deixe ambos vazios.", true); return false; }
       const finished = homeScoreValue !== "" && awayScoreValue !== "";
-      await VestiBackend.saveMatch({
-        id: match?.id,
+      const data = {
         home: String(formData.get("home")).trim(),
         away: String(formData.get("away")).trim(),
         homeEmoji: String(formData.get("homeEmoji") || "⚽").trim(),
         awayEmoji: String(formData.get("awayEmoji") || "⚽").trim(),
-        homeLogoUrl: await readLogo("homeLogo", match?.homeLogoUrl),
-        awayLogoUrl: await readLogo("awayLogo", match?.awayLogoUrl),
-        competition: String(formData.get("competition") || "").trim(),
         startsAt: new Date(startsAt).toISOString(),
         status: finished ? "finished" : "upcoming",
         homeScore: finished ? Number(homeScoreValue) : null,
-        awayScore: finished ? Number(awayScoreValue) : null
-      });
+        awayScore: finished ? Number(awayScoreValue) : null,
+        competition: String(formData.get("competition") || "").trim()
+      };
+      await VestiStore.saveMatch(data, match?.id, formData.getAll("poolIds"));
       await refreshState();
-      toast(finished ? "Resultado registrado. Os rankings foram atualizados." : "Partida salva.");
+      toast(finished ? "Resultado salvo. O ranking foi atualizado." : "Partida salva.");
       return true;
     });
   }
@@ -500,19 +498,14 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
     const content = `<div id="profile-modal-form"><div class="field"><label>Nome</label><input name="name" value="${esc(user.name)}" required minlength="2" maxlength="60"></div><div class="field" style="margin-top:12px"><label>Foto de perfil</label><div class="avatar-upload">${avatar(user)}<input name="avatarFile" type="file" accept="image/*" aria-label="Escolher imagem"></div><span class="field-help">Imagem JPG ou PNG de até 1 MB.</span></div><div class="field" style="margin-top:12px"><label>Nova senha <span class="field-help">(opcional)</span></label><input name="password" type="password" minlength="6" placeholder="Mínimo de 6 caracteres"></div></div>`;
     showModal("Editar perfil", content, "Salvar alterações", async (formData) => {
       const form = document.getElementById("modal-form");
-      const file = form.querySelector('input[type="file"]').files[0];
-      let avatarUrl = user.avatar;
-      if (file) {
-        if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) { toast("Use uma imagem JPG, PNG ou WebP.", true); return false; }
-        if (file.size > 1024 * 1024) { toast("A foto precisa ter até 1 MB.", true); return false; }
-        avatarUrl = await VestiBackend.uploadImage("avatars", file);
-      }
-      const name = String(formData.get("name")).trim();
-      const password = String(formData.get("password") || "");
-      await VestiBackend.updateProfile(name, avatarUrl);
-      if (password) await VestiBackend.changePassword(password);
+      if (!form.reportValidity()) return false;
+      await VestiStore.updateProfile({
+        name: String(formData.get("name")).trim(),
+        password: String(formData.get("password") || ""),
+        file: form.querySelector('input[type="file"]').files[0] || null
+      });
       await refreshState();
-      toast(password ? "Perfil e senha atualizados." : "Perfil atualizado.");
+      toast("Perfil atualizado.");
       return true;
     });
   }
@@ -522,26 +515,26 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
     const rules = pointSettings(pool);
     const content = `<div class="field"><label>Placar exato (pontos)</label><input name="exact" type="number" min="0" max="100" value="${rules.exact}" required></div><div class="field" style="margin-top:12px"><label>Resultado correto (pontos)</label><input name="outcome" type="number" min="0" max="100" value="${rules.outcome}" required></div><div class="field" style="margin-top:12px"><label>Acerto por equipe (pontos)</label><input name="goals" type="number" min="0" max="100" value="${rules.goals}" required></div><p style="margin-top:12px">O ranking será atualizado com as novas regras assim que você salvar.</p>`;
     showModal("Regras de pontuação", content, "Salvar regras", async (formData) => {
-      await VestiBackend.updatePoolSettings(pool.id, {
-        ...rules,
+      await VestiStore.updatePoolRules(poolId, {
         exact: Number(formData.get("exact")),
         outcome: Number(formData.get("outcome")),
         goals: Number(formData.get("goals"))
       });
       await refreshState();
-      toast("Regras atualizadas e pontuações recalculadas.");
+      toast("Regras atualizadas.");
       return true;
     });
   }
   function joinPoolModal() {
-    const content = `<p>Digite o código de convite compartilhado pelo organizador do bolão.</p><div class="field"><label for="invite-code-input">Código do convite</label><input id="invite-code-input" name="code" required maxlength="24" placeholder="Ex.: BR25GO" style="text-transform:uppercase"></div>`;
+    const content = `<p>Digite o código de convite compartilhado pelo organizador do bolão.</p><div class="field"><label for="invite-code-input">Código do convite</label><input id="invite-code-input" name="code" required maxlength="24" placeholder="Ex.: código do convite" style="text-transform:uppercase"></div>`;
     showModal("Entrar em um bolão", content, "Encontrar bolão", async (formData) => {
       const code = String(formData.get("code")).trim().toUpperCase();
-      const poolId = await VestiBackend.joinPool(code);
-      await refreshState();
-      const pool = getPool(poolId);
+      await VestiStore.joinPoolByCode(code);
+      state = await VestiStore.refresh();
+      const pool = state.pools.find((item) => item.inviteCode.toUpperCase() === code);
       toast(pool ? `Você entrou em ${pool.name}!` : "Você entrou no bolão.");
-      go(`pool/${poolId}`);
+      if (pool) go(`pool/${pool.id}`);
+      render();
       return true;
     });
   }
@@ -561,46 +554,52 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
   async function joinPublicPool(poolId) {
     const pool = getPool(poolId);
     if (!pool || pool.visibility !== "public") return toast("Este bolão não está disponível para entrada pública.", true);
-    if (pool.members.includes(currentUser().id)) return go(`pool/${pool.id}`);
-    await VestiBackend.joinPublicPool(pool.id);
-    await refreshState();
-    toast(`Você entrou em ${pool.name}!`);
-    go(`pool/${pool.id}`);
+    await run(() => VestiStore.joinPublicPool(pool.id), `Você entrou em ${pool.name}!`, `pool/${pool.id}`);
   }
   async function handleAction(event) {
     const target = event.target.closest("[data-action]");
     if (!target) return;
     const action = target.dataset.action;
-    if (action === "logout") { await VestiBackend.signOut(); sessionUser = null; state = emptyState(); go("login"); render(); }
+    if (action === "logout") {
+      try { await VestiStore.signOut(); state = VestiStore.get(); go("login"); render(); }
+      catch (error) { toast(error.message, true); }
+    }
     else if (action === "join-pool") joinPoolModal();
     else if (action === "copy-invite") copyInvite(target.dataset.pool);
-    else if (action === "join-public") await joinPublicPool(target.dataset.pool);
+    else if (action === "join-public") joinPublicPool(target.dataset.pool);
     else if (action === "edit-profile") editProfileModal();
     else if (action === "notifications") notificationsModal();
     else if (action === "new-match") modalMatch();
     else if (action === "edit-match") modalMatch(getMatch(target.dataset.match));
+    else if (action === "edit-pool") editPoolModal(target.dataset.pool);
+    else if (action === "delete-pool") {
+      const pool = getPool(target.dataset.pool);
+      if (!pool || !(pool.ownerId === currentUser().id || currentUser().role === "admin")) return toast("Somente o organizador pode excluir este bolão.", true);
+      showModal("Excluir bolão", `<p>O bolão <strong>${esc(pool.name)}</strong>, seus palpites e participantes serão removidos permanentemente. Esta ação não pode ser desfeita.</p>`, "Excluir bolão", async () => {
+        await VestiStore.deletePool(pool.id);
+        await refreshState();
+        toast("Bolão excluído.");
+        go("admin");
+        return true;
+      });
+    }
     else if (action === "edit-rules") editRulesModal(target.dataset.pool);
     else if (action === "admin-tab") { adminTab = target.dataset.tab; render(); }
-    else if (action === "select-pool") { state.currentPoolId = target.dataset.pool; go(`picks/${encodeURIComponent(target.dataset.pool)}`); }
-    else if (action === "select-ranking") { state.currentPoolId = target.dataset.pool; go(`ranking/${encodeURIComponent(target.dataset.pool)}`); }
+    else if (action === "select-pool") { selectedPoolId = target.dataset.pool; state.currentPoolId = selectedPoolId; go(`picks/${encodeURIComponent(target.dataset.pool)}`); }
+    else if (action === "select-ranking") { selectedPoolId = target.dataset.pool; state.currentPoolId = selectedPoolId; go(`ranking/${encodeURIComponent(target.dataset.pool)}`); }
     else if (action === "toggle-picks") {
       const pool = getPool(target.dataset.pool);
       if (!pool || !(pool.ownerId === currentUser().id || currentUser().role === "admin")) return toast("Somente o organizador pode alterar esta opção.", true);
-      await VestiBackend.updatePoolSettings(pool.id, { ...pool.settings, showPicks: !pool.settings.showPicks });
-      await refreshState();
+      await run(() => VestiStore.updateRevealPicks(pool.id, !pool.settings.showPicks));
     } else if (action === "toggle-admin") {
-      const targetUser = getUser(target.dataset.user);
-      if (!targetUser || targetUser.id === currentUser().id) return;
-      const role = targetUser.role === "admin" ? "user" : "admin";
-      await VestiBackend.setProfileRole(targetUser.id, role);
-      await refreshState();
-      toast(`Permissão de ${targetUser.name} atualizada.`);
-    } else if (action === "retry-load") {
-      await refreshState(true);
+      const user = getUser(target.dataset.user);
+      if (!user || user.id === currentUser().id) return;
+      const role = user.role === "admin" ? "user" : "admin";
+      await run(() => VestiStore.setProfileRole(user.id, role), `Permissão de ${user.name} atualizada.`);
     } else if (action === "close-modal") target.closest(".modal-backdrop")?.remove();
   }
   app.addEventListener("click", (event) => {
-    handleAction(event).catch(reportError);
+    handleAction(event).catch((error) => toast(error.message || "Não foi possível concluir a operação.", true));
   });
   app.addEventListener("input", (event) => {
     if (event.target.matches('.search-box input')) {
@@ -615,49 +614,32 @@ import { isSupabaseConfigured, supabase, VestiBackend } from "./supabase.js";
     }
   });
   window.addEventListener("hashchange", render);
-  if (isSupabaseConfigured) {
-    const connectRealtime = () => {
-      if (realtimeChannel) supabase.removeChannel(realtimeChannel);
-      realtimeChannel = null;
-      if (!sessionUser) return;
-      realtimeChannel = VestiBackend.subscribeToUpdates(() => {
-        clearTimeout(realtimeRefresh);
-        realtimeRefresh = setTimeout(() => refreshState(), 250);
-      }, (error) => {
-        console.error("A conexão de atualizações em tempo real do Supabase falhou.", error);
-        if (!hasReportedRealtimeError) {
-          hasReportedRealtimeError = true;
-          toast("Atualizações ao vivo indisponíveis. Recarregue para buscar os dados recentes.", true);
-        }
-      });
-    };
-    VestiBackend.onAuthStateChange((_event, session) => {
-      queueMicrotask(() => {
-        sessionUser = session?.user || null;
-        if (!sessionUser) {
-          loadSequence += 1;
-          if (realtimeChannel) supabase.removeChannel(realtimeChannel);
-          realtimeChannel = null;
-          isLoading = false;
-          loadError = "";
-          state = emptyState();
-          render();
-        } else if (sessionUser.id !== state.currentUserId) {
-          connectRealtime();
-          refreshState(true);
-        }
-      });
-    });
-    VestiBackend.getSession().then((session) => {
-      sessionUser = session?.user || null;
-      if (sessionUser) {
-        connectRealtime();
-        return refreshState(true);
-      }
+  render();
+  VestiStore.initialize(async () => {
+    loading = true;
+    render();
+    try {
+      state = await VestiStore.refresh();
+      loading = false;
       render();
-    }).catch((error) => {
-      loadError = error.message;
+    } catch (error) {
+      loading = false;
+      toast(error.message || "Não foi possível carregar os dados do Supabase.", true);
       render();
-    });
-  } else render();
+    }
+  }, () => {
+    state = VestiStore.get();
+    render();
+  }).then((result) => {
+    configured = result.configured;
+    state = result.state;
+    loading = false;
+    render();
+  }).catch((error) => {
+    configured = true;
+    loading = false;
+    state = VestiStore.get();
+    toast(error.message || "Não foi possível conectar ao Supabase.", true);
+    render();
+  });
 })();
